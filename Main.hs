@@ -12,15 +12,15 @@ import Control.Monad
 import Control.Monad.State
 
 import Graphics.GPipe
-import Graphics.GPipe.Context.GLFW as GLFW
+import Graphics.GPipe.Context
+import qualified Graphics.GPipe.Context.GLFW as GLFW
 import Graphics.UI.GLFW (swapInterval)
 
 import System.Random
 import Control.Concurrent
 import Control.Concurrent.STM
 
-{- TODO:
-import System.IO -}
+import System.Mem (performGC)
 import System.Clock
 import Formatting
 import Formatting.Clock
@@ -58,7 +58,7 @@ gravity :: (Floating a, Epsilon a) => Point a -> Point a -> Point a
 gravity !p1 !p2 = pd ^* s
   where
     !pd = p2 - p1
-    !s = 1000 / sqrt (r^3)
+    !s = 100 / sqrt (r^3)
     !r = 0.1 + distance p2 p1
 {-# INLINE gravity #-}
 
@@ -83,44 +83,42 @@ toBody ori theta r v = V3 (loc + ori) vel (V2 0 0)
         vel =  v * 1000 *^ normalize (rotate90 loc)
 
 -- Initial seed of system.
-initSystem :: (Random a, V.Unbox a, Epsilon a, Floating a, RandomGen s, MonadState s m) => Int -> Point a -> m (V.Vector (Body a))
-initSystem n ori = V.replicateM n (toBody ori <$> getR 0    (pi*2)       -- Angle
-                                              <*> getR 0.35   1  -- Radius
-                                              <*> getR 0.9  10.2) -- Velocity
+initSystem :: (Random a, V.Unbox a, Epsilon a, Floating a, RandomGen s, MonadState s m) => a -> Int -> Point a -> m (V.Vector (Body a))
+initSystem rad n ori = V.replicateM n $ do
+                                       a <- getR 0  (pi*2)       -- Angle
+                                       r <- getR (rad*0.7)  (rad*1.3)  -- Radius
+                                       let r' = 1.5 * rad - r
+                                       v <- getR (r'*3) (r'*6) -- Velocity
+                                       return $ toBody ori a r v
                         where getR a b = state (randomR (a, b))
 -- Render loop
-{-
-  
-loop :: forall os c ds a a1.
-                 (Num a, Floating a, Real a, Eval.Elt a, V.Unbox a, ContextColorFormat c, HostFormat a1 ~ (Point a),
-                  Color c Float ~ V3 a) =>
-                 Buffer os a1
-                 -> Buffer os a1
-                 -> (PrimitiveArray Triangles (a1, a1) -> Render os (ContextFormat c ds) ())
-                 -> System a
-                 -> ContextT GLFWWindow os (ContextFormat c ds) IO () -}
-renderloop hexB posB shader systemv = do
-  system <- lift . atomically $ takeTMVar systemv
-  writeBuffer posB 0 (sysToList system)
-  render $ do
-    clearContextColor (V3 0 0 0)
-    hexArray <- newVertexArray hexB
-    posArray <- newVertexArray posB
-    let -- pArray :: PrimitiveArray p (V2 Float)
-        pArray = toPrimitiveArrayInstanced TriangleFan (,) hexArray posArray
-    shader pArray
+renderloop win hexB posB shader systemv = lift (getTime Realtime) >>= loop
+  where
+    loop t = do
+      system <- lift . atomically $ readTBQueue systemv
+      writeBuffer posB 0 (sysToList system)
+      render $ do
+        clearWindowColor win (V3 0 0 0)
+        hexArray <- newVertexArray hexB
+        posArray <- newVertexArray posB
+        let -- pArray :: PrimitiveArray p (V2 Float)
+          pArray = toPrimitiveArrayInstanced TriangleFan (,) hexArray posArray
+        shader pArray
 
-  swapContextBuffers
+      swapWindowBuffers win
 
+      t' <- lift $ getTime Realtime
+      lift $ fprint ( timeSpecs % "\n" ) t t'
+      lift $ performGC
 
-  closeRequested <- GLFW.windowShouldClose
-  unless closeRequested $
-         renderloop hexB posB shader systemv
- 
+      closeRequested <- GLFW.windowShouldClose win
+      case closeRequested of
+        Just False -> loop t'
+        _ -> return ()
 
 systemloop systemv system = do
           system' <- runUniverseTick system
-          atomically $ putTMVar systemv system'
+          atomically $ writeTBQueue systemv system'
           systemloop systemv system'
 
 -- Literally in the name, converts system coords to screen coords.
@@ -160,34 +158,26 @@ main = do
   let wsizex = 1280
       wsizey = 720
       aspect = fromIntegral wsizex / fromIntegral wsizey
-      winConf :: GLFW.WindowConf
-      winConf = GLFW.WindowConf wsizex wsizey "NBody Sim"
+      winConf :: GLFW.WindowConfig
+      winConf = GLFW.WindowConfig wsizex wsizey "NBody Sim" Nothing [] (Just 2)
       msize = 350 :: Int
       asize = 350 :: Int
       seed  = mkStdGen 45693762934762945
       size  = msize+asize
       sys = flip evalState seed $ (R.++)
-                               <$> (R.fromUnboxed (R.Z R.:. msize) <$> initSystem msize (V2   2000  0))
-                               <*> (R.fromUnboxed (R.Z R.:. asize) <$> initSystem asize (V2 (-2000) 0))
+                               <$> (R.fromUnboxed (R.Z R.:. msize) <$> initSystem 1.3 msize (V2   500  0))
+                               <*> (R.fromUnboxed (R.Z R.:. asize) <$> initSystem 0.7 asize (V2 (-500) 0))
 
   univers :: System PointT <- R.computeP (sys)
   system  <- initUniverse size univers
-  systemv <- atomically $ newTMVar system
+  systemv <- atomically $ newTBQueue 3
+  atomically $ writeTBQueue systemv system
   forkIO (systemloop systemv system)
-  t <- getTime Realtime
-  let mainloop t = do
-                   _ <- atomically $ takeTMVar systemv
-                   t' <- getTime Realtime
-                   fprint ( timeSpecs % "\n" ) t t'
-                   mainloop t'
-
-  mainloop t
-  {- 
-  runContextT (GLFW.newContext' [] winConf) (ContextFormatColor RGB8) $ do
-    -- lift $ swapInterval 1 -- Set vsync on
+  
+  runContextT GLFW.defaultHandleConfig $ do
+    win <- newWindow (WindowFormatColorDepth RGB8 Depth16) winConf
 
     -- Create initial system state
-    
 
     -- Plug the system in to a vertex array ready for rendering
     posBuffer :: Buffer os (B2 Float) <- newBuffer size
@@ -203,13 +193,19 @@ main = do
     uniformBuffer :: Buffer os (Uniform (B Float)) <- newBuffer 1
     writeBuffer uniformBuffer 0 [aspect]
 
-    shader <- compileShader $ do
-      primitiveStream <- toPrimitiveStream id
-      aspectU <- getUniform (const (uniformBuffer, 0))
-      let --pStream2 :: PrimitiveStream Triangles (V4 VFloat, V3 VFloat)
-          pStream2 = toScreenCoords aspectU <$> primitiveStream
-      fragmentStream <- rasterize (const (FrontAndBack, ViewPort (V2 0 0) (V2 wsizex wsizey), DepthRange 0 1)) pStream2
-      drawContextColor (const (ContextColorOption NoBlending (V3 True True True))) fragmentStream
-
-    renderloop hexBuffer posBuffer shader systemv
-    -}
+    let
+      preShader :: Shader
+                       os
+                       (PrimitiveArray Triangles (B2 Float, B2 Float))
+                       ()
+      preShader = do
+          primitiveStream <- toPrimitiveStream id
+          aspectU <- getUniform (const (uniformBuffer, 0))
+          let --pStream2 :: PrimitiveStream Triangles (V4 VFloat, V3 VFloat)
+            pStream2 = toScreenCoords aspectU <$> primitiveStream
+          fragmentStream <- rasterize (const (FrontAndBack, ViewPort (V2 0 0) (V2 wsizex wsizey), DepthRange 0 1))
+                                      pStream2
+          drawWindowColor (const (win, ContextColorOption NoBlending (V3 True True True))) fragmentStream
+    shader <- compileShader preShader
+    renderloop win hexBuffer posBuffer shader systemv
+    
