@@ -1,4 +1,4 @@
-## Basic niave O(n²) simulation of gravity.
+## Basic naive O(n²) simulation of gravity.
 
 click for video:
 
